@@ -3,14 +3,17 @@ import json
 import time
 import hmac
 import hashlib
-import base64
+import sys
+import traceback
 from io import BytesIO
 from http.server import BaseHTTPRequestHandler
+from email.parser import BytesParser
+from email.policy import default
 
 import google.generativeai as genai
 import PIL.Image
 
-# --- AI Prompt ---
+# --- Latest Prompt Logic ---
 AI_PROMPT = """
 You are a brutally honest pre-post image reviewer.
 
@@ -34,7 +37,7 @@ If it's strong — hype it confidently.
 Default stance: slightly skeptical.
 
 -------------------------
-SCORING PROCESS (MANDATORY ORDER):
+SCORING PROCESS (MANDATORY ORDER) :
 
 1. FIRST decide the score strictly using the scale below.
 2. THEN write the review explaining WHY it deserves that exact score.
@@ -53,7 +56,7 @@ If score is:
 Score and tone must align logically.
 
 -------------------------
-SCORING SCALE:
+SCORING SCALE: 
 
 1.0–2.9 → Public embarrassment.
 3.0–4.9 → Weak.
@@ -93,8 +96,8 @@ If score and review mismatch, the response is incorrect.
 Be useful. Be funny. Be honest.
 """
 
-# --- Rate Limiting (Firebase) ---
-def get_firebase_db():
+# --- Firebase Admin ---
+def get_db():
     try:
         import firebase_admin
         from firebase_admin import credentials, firestore
@@ -104,201 +107,124 @@ def get_firebase_db():
                 cred_dict = json.loads(service_account_json)
                 cred = credentials.Certificate(cred_dict)
                 firebase_admin.initialize_app(cred)
+            else:
+                return None
         return firestore.client()
     except Exception as e:
-        print(f"Firebase init error: {e}")
+        print(f"Firebase Init Error: {e}", file=sys.stderr)
         return None
 
-
-def enforce_rate_limit(db):
-    """Returns seconds to wait (0 = proceed immediately)."""
-    if not db:
-        return 0
-    try:
-        from firebase_admin import firestore
-        rate_limit_ref = db.collection('admin').document('rate_limiter')
-
-        @firestore.transactional
-        def _transaction(transaction, doc_ref):
-            snapshot = doc_ref.get(transaction=transaction)
-            current_time = time.time()
-
-            if not snapshot.exists:
-                transaction.set(doc_ref, {
-                    'last_request_processed_timestamp': current_time,
-                    'total_request_processed_in_this_minute': 1,
-                    'update_data_at_timestamp': current_time
-                })
-                return 0
-
-            data = snapshot.to_dict()
-            last_req = data.get('last_request_processed_timestamp', 0)
-            total_req = data.get('total_request_processed_in_this_minute', 0)
-            update_at = data.get('update_data_at_timestamp', current_time)
-
-            sleep_duration = 0
-            if (current_time - last_req) < 6:
-                if total_req > 10:
-                    sleep_duration = max(0, 60 - (current_time - update_at))
-                    transaction.update(doc_ref, {
-                        'last_request_processed_timestamp': current_time + sleep_duration,
-                        'total_request_processed_in_this_minute': 1,
-                        'update_data_at_timestamp': current_time + sleep_duration
-                    })
-                else:
-                    transaction.update(doc_ref, {
-                        'last_request_processed_timestamp': current_time,
-                        'total_request_processed_in_this_minute': total_req + 1
-                    })
-            else:
-                new_total = 1 if (current_time - update_at) >= 60 else total_req + 1
-                new_ts = current_time if (current_time - update_at) >= 60 else update_at
-                transaction.update(doc_ref, {
-                    'last_request_processed_timestamp': current_time,
-                    'total_request_processed_in_this_minute': new_total,
-                    'update_data_at_timestamp': new_ts
-                })
-            return sleep_duration
-
-        txn = db.transaction()
-        return _transaction(txn, rate_limit_ref)
-    except Exception as e:
-        print(f"Rate limit error: {e}")
-        return 0
-
-
-def log_error(db, email, error_msg):
-    try:
-        if db:
-            from firebase_admin import firestore
-            import datetime
-            db.collection('admin').document('config').collection('logs').add({
-                'email': email or 'anonymous',
-                'error': error_msg,
-                'timestamp': firestore.SERVER_TIMESTAMP
-            })
-    except Exception as e:
-        print(f"Logging error: {e}")
-
-
 class handler(BaseHTTPRequestHandler):
-
     def do_OPTIONS(self):
         self.send_response(200)
-        self._send_cors_headers()
+        self._send_cors()
         self.end_headers()
 
+    def do_GET(self):
+        self._json_response({"status": "Online", "service": "PrePublic AI Review"}, 200)
+
     def do_POST(self):
-        # --- Setup ---
-        GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-        GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
-
-        if not GEMINI_API_KEY:
-            self._json_response({"error": "Gemini API key not configured."}, 500)
-            return
-
-        # --- Parse multipart form data ---
-        content_type = self.headers.get('Content-Type', '')
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length)
-
-        image_data = None
-        platform = 'Other'
-        language = 'English'
-
         try:
-            # Extract boundary from content type
-            boundary = None
-            for part in content_type.split(';'):
-                part = part.strip()
-                if part.startswith('boundary='):
-                    boundary = part[len('boundary='):].strip().encode()
-                    break
+            db = get_db()
+            
+            # 1. Maintenance Check
+            if db:
+                try:
+                    config = db.collection('admin').document('config').get()
+                    if config.exists and config.to_dict().get('isMaintenance', False):
+                        self._json_response({"error": "System is currently under maintenance."}, 503)
+                        return
+                except: pass
 
-            if not boundary:
-                self._json_response({"error": "No boundary in multipart"}, 400)
+            # 2. Rate Limiting Logic
+            wait_time = self._enforce_limit(db)
+            if wait_time > 0:
+                time.sleep(wait_time)
+
+            # 3. Parse Multipart Form
+            ctype = self.headers.get('Content-Type', '')
+            clength = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(clength)
+            
+            # Extract boundary
+            msg_raw = f"Content-Type: {ctype}\r\n\r\n".encode() + body
+            msg = BytesParser(policy=default).parsebytes(msg_raw)
+            
+            p_img, p_plat, p_lang = None, "Other", "English"
+            if msg.is_multipart():
+                for part in msg.iter_parts():
+                    name = part.get_param('name', header='content-disposition')
+                    if name == 'image': p_img = part.get_payload(decode=True)
+                    elif name == 'platform': p_plat = part.get_payload(decode=True).decode(errors='replace').strip()
+                    elif name == 'language': p_lang = part.get_payload(decode=True).decode(errors='replace').strip()
+            
+            if not p_img:
+                self._json_response({"error": "No image found in request."}, 400)
                 return
 
-            # Split body into parts
-            parts = body.split(b'--' + boundary)
-            for part in parts:
-                if b'Content-Disposition' not in part:
-                    continue
-                header_end = part.find(b'\r\n\r\n')
-                if header_end == -1:
-                    continue
-                headers_raw = part[:header_end].decode(errors='replace')
-                data = part[header_end + 4:].rstrip(b'\r\n--')
-
-                if 'name="image"' in headers_raw:
-                    image_data = data
-                elif 'name="platform"' in headers_raw:
-                    platform = data.decode(errors='replace').strip()
-                elif 'name="language"' in headers_raw:
-                    language = data.decode(errors='replace').strip()
-
-        except Exception as e:
-            self._json_response({"error": f"Form parse error: {str(e)}"}, 400)
-            return
-
-        if not image_data:
-            self._json_response({"error": "No image provided"}, 400)
-            return
-
-        # --- Rate Limiting ---
-        db = get_firebase_db()
-        wait_time = enforce_rate_limit(db)
-        if wait_time > 0:
-            print(f"Rate limiting: sleeping {wait_time:.2f}s")
-            time.sleep(wait_time)
-
-        # --- Call Gemini ---
-        try:
-            genai.configure(api_key=GEMINI_API_KEY)
-            model = genai.GenerativeModel(GEMINI_MODEL)
-
-            img = PIL.Image.open(BytesIO(image_data))
-            prompt = AI_PROMPT.replace('{platform}', platform).replace('{language_tone}', language)
+            # 4. Gemini Execution
+            genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
+            model_name = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+            model = genai.GenerativeModel(model_name)
+            
+            img = PIL.Image.open(BytesIO(p_img))
+            prompt = AI_PROMPT.replace('{platform}', p_plat).replace('{language_tone}', p_lang)
+            
             response = model.generate_content([prompt, img])
-
-            response_text = response.text.strip()
-            # Strip markdown fences
+            text = response.text.strip()
+            
+            # Clean JSON
             for fence in ["```json", "```"]:
-                if response_text.startswith(fence):
-                    response_text = response_text[len(fence):]
-            if response_text.endswith("```"):
-                response_text = response_text[:-3]
+                if text.startswith(fence): text = text[len(fence):]
+            if text.endswith("```"): text = text[:-3]
+            
+            res_data = json.loads(text.strip())
+            self._json_response(res_data, 200)
 
-            data = json.loads(response_text.strip())
-            self._json_response({
-                "score":      data.get("score", 5.0),
-                "roast_line": data.get("roast_line", "Something went wrong."),
-                "fix_line":   data.get("fix_line", "Try again."),
-                "tags":       data.get("tags", []),
-                "emojiTone":  data.get("emojiTone", "neutral")
-            }, 200)
-
-        except json.JSONDecodeError:
-            log_error(db, None, "JSON parse error in Gemini response")
-            self._json_response({"error": "AI response was not valid JSON."}, 500)
         except Exception as e:
-            error_msg = str(e)
-            print(f"Error: {error_msg}")
-            log_error(db, None, f"Review error: {error_msg}")
-            if "429" in error_msg or "Quota" in error_msg or "exhausted" in error_msg.lower():
-                self._json_response({"error": "High traffic. Please try again in 1 minute."}, 429)
+            traceback.print_exc(file=sys.stderr)
+            err_str = str(e)
+            if "429" in err_str or "Quota" in err_str:
+                self._json_response({"error": "Global AI capacity reached. Try again in 1 minute."}, 429)
             else:
-                self._json_response({"error": "We are facing some issues, please try again later."}, 500)
+                self._json_response({"error": "Internal processor error. Please try again."}, 500)
 
-    def _send_cors_headers(self):
+    def _enforce_limit(self, db):
+        if not db: return 0
+        try:
+            from firebase_admin import firestore
+            ref = db.collection('admin').document('rate_limiter')
+            @firestore.transactional
+            def _txn(transaction, doc_ref):
+                snap = doc_ref.get(transaction=transaction)
+                now = time.time()
+                if not snap.exists:
+                    transaction.set(doc_ref, {'last_request_processed_timestamp': now, 'total_request_processed_in_this_minute': 1, 'update_data_at_timestamp': now})
+                    return 0
+                d = snap.to_dict()
+                last, total, update = d.get('last_request_processed_timestamp', 0), d.get('total_request_processed_in_this_minute', 0), d.get('update_data_at_timestamp', now)
+                
+                sleep = 0
+                if (now - last) < 6 and total > 10:
+                    sleep = max(0, 60 - (now - update))
+                    transaction.update(doc_ref, {'last_request_processed_timestamp': now + sleep, 'total_request_processed_in_this_minute': 1, 'update_data_at_timestamp': now + sleep})
+                else:
+                    new_total = 1 if (now - update) >= 60 else total + 1
+                    new_up = now if (now - update) >= 60 else update
+                    transaction.update(doc_ref, {'last_request_processed_timestamp': now, 'total_request_processed_in_this_minute': new_total, 'update_data_at_timestamp': new_up})
+                return sleep
+            return _txn(db.transaction(), ref)
+        except: return 0
+
+    def _send_cors(self):
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
 
-    def _json_response(self, data, status=200):
+    def _json_response(self, data, status):
         body = json.dumps(data).encode()
         self.send_response(status)
-        self._send_cors_headers()
+        self._send_cors()
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()

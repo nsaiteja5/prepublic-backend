@@ -10,7 +10,8 @@ from http.server import BaseHTTPRequestHandler
 from email.parser import BytesParser
 from email.policy import default
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import PIL.Image
 
 # --- Latest Prompt Logic ---
@@ -163,14 +164,38 @@ class handler(BaseHTTPRequestHandler):
                 return
 
             # 4. Gemini Execution
-            genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
-            model_name = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
-            model = genai.GenerativeModel(model_name)
-            
+            api_key = os.environ.get("GEMINI_API_KEY", "")
+            model_name = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+
+            # Load generation params from environment
+            try:
+                temperature = float(os.environ.get("GEMINI_TEMPERATURE", "1.0"))
+            except (ValueError, TypeError):
+                temperature = 1.0
+
+            try:
+                top_k = int(os.environ.get("GEMINI_TOP_K", "70"))
+            except (ValueError, TypeError):
+                top_k = 70
+
+            try:
+                top_p = float(os.environ.get("GEMINI_TOP_P", "0.8"))
+            except (ValueError, TypeError):
+                top_p = 0.8
+
+            client = genai.Client(api_key=api_key)
             img = PIL.Image.open(BytesIO(p_img))
             prompt = AI_PROMPT.replace('{platform}', p_plat).replace('{language_tone}', p_lang)
-            
-            response = model.generate_content([prompt, img])
+
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[prompt, img],
+                config=types.GenerateContentConfig(
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p
+                )
+            )
             text = response.text.strip()
             
             # Clean JSON
